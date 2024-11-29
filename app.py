@@ -52,9 +52,13 @@ transcribe_pipe = pipeline(
 
 tts_queue = queue.Queue()
 chunk_intervals = [5, 25, 125, 625]
-reply_chunk_num = 0
 
 cosyvoice = CosyVoice('/home/jake/models/CosyVoice-300M-Instruct', load_jit=False, load_onnx=False, fp16=True)
+
+rounds = 0
+first_audio = True
+interrupt = False
+interrupt_threshold = 3
 
 def listening_callback(indata, frames, time, status):
     if status:
@@ -62,7 +66,7 @@ def listening_callback(indata, frames, time, status):
     global audio_buffer
     audio_buffer = np.append(audio_buffer, indata[:, 0])
 
-def tts_worker(tts_queue, audio_temp_folder):
+def tts_worker(tts_queue, audio_temp_folder, interruption_event):
     while True:
         item = tts_queue.get()
         if item is None:
@@ -75,8 +79,17 @@ def tts_worker(tts_queue, audio_temp_folder):
             cleaned_text,
             '英文女',
             'Assistant is a young female speaker.',
-            stream=False
+            stream=True
         ):
+            if interruption_event.is_set():
+                print("Inference interrupted!")
+                while not tts_queue.empty():
+                    try:
+                        tts_queue.get_nowait()
+                        tts_queue.task_done()
+                    except queue.Empty:
+                        break 
+                break
             audio_tensor = output_data['tts_speech']
             audio_data = audio_tensor.numpy().T
             output_data_list.append(audio_data)
@@ -88,10 +101,22 @@ def tts_worker(tts_queue, audio_temp_folder):
 
         tts_queue.task_done()
 
-def audio_playback(audio_temp_folder):
-    global first_audio
+def delete_all_files(folder_path):
+    for filename in os.listdir(folder_path):
+        file_path = os.path.join(folder_path, filename)
+        if os.path.isfile(file_path):
+            os.remove(file_path)
+
+def audio_playback(audio_temp_folder, interruption_event):
+    global first_audio, interrupt
 
     while True:
+        if interrupt:
+            delete_all_files(audio_temp_folder)
+            interruption_event.set()
+            interrupt = False
+            continue
+
         files = sorted(
             [f for f in os.listdir(audio_temp_folder) if f.endswith('.wav')],
             key=lambda x: int(re.findall(r'\d+', x)[0])
@@ -103,17 +128,30 @@ def audio_playback(audio_temp_folder):
             if first_audio:
                 print(f"{'*' * 50}\nTime to first audio: {time.time() - latency:.2f} seconds\n{'*' * 50}")
                 first_audio = False
-            sd.play(audio_data, sampling_rate)
-            sd.wait()
-            os.remove(file_path)
 
+            if play_audio(audio_data, sampling_rate):
+                os.remove(file_path)
         time.sleep(0.1)
 
-tts_thread = threading.Thread(target=tts_worker, args=(tts_queue, audio_temp_folder))
+def play_audio(audio_data, sampling_rate):
+    global interrupt
+    if interrupt:
+        return False
+    sd.play(audio_data, sampling_rate)
+    while sd.get_stream().active:
+        if interrupt:
+            sd.stop()
+            return False
+        time.sleep(0.1)
+    return True
+
+interruption_event = threading.Event()
+
+tts_thread = threading.Thread(target=tts_worker, args=(tts_queue, audio_temp_folder, interruption_event))
 tts_thread.daemon = True
 tts_thread.start()
 
-playback_thread = threading.Thread(target=audio_playback, args=(audio_temp_folder,))
+playback_thread = threading.Thread(target=audio_playback, args=(audio_temp_folder,interruption_event))
 playback_thread.daemon = True
 playback_thread.start()
 
@@ -125,12 +163,10 @@ Enhance Engagement and Accessibility: Ensure that your responses are not only in
 Be Attuned to User Indications: Adapt to the user's cues. If more detailed information is requested ("Can you elaborate?"), provide it succinctly yet comprehensively.
 Maintain a Warm and Inviting Tone: Adopt a friendly and approachable tone, creating a pleasant and enjoyable auditory experience for the user.
 """
-
 messages = [{"role": "system", "content": system_prompt}]
-rounds = 0
 
+print("Started!")
 while True:
-    first_audio = True
     audio_buffer = np.empty((0,), dtype=np.float32)
     stream = sd.InputStream(callback=listening_callback, channels=1, samplerate=sampling_rate)
     stream.start()
@@ -140,9 +176,9 @@ while True:
         prev_end = 0
         prev_blocks_num = 0
         loops = 0
+        interrupt_count = 0
 
         while True:
-            print("Listening...")
             time.sleep(listening_interval)
             audio_max = np.max(np.abs(audio_buffer))
             if audio_max > 0:
@@ -161,6 +197,9 @@ while True:
             
             if len(speech_blocks) > 0:
                 print(f"Audio detected - start {start} - prev_end {prev_end} - {speech_blocks}")
+                interrupt_count += 1
+                if interrupt_count >= interrupt_threshold:
+                    interrupt = True
                 if len(speech_blocks) == 1:
                     start = speech_blocks[0]["start"]
                     end = speech_blocks[0]["end"] 
@@ -224,6 +263,9 @@ while True:
     chunks_collected = []
     chunk_counter = 0
     interval_index = 0
+    reply_chunk_num = 0
+    interrupt = False
+    interruption_event.clear()
 
     for line in llm_response.iter_lines():
         if line:
