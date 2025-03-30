@@ -16,14 +16,19 @@ from silero_vad import load_silero_vad, get_speech_timestamps
 
 from cosyvoice.cli.cosyvoice import CosyVoice
 
-llm_url = 'http://172.16.17.2:30001/v1/chat/completions'
+LLM_ENDPOINT = 'http://localhost:8000/v1/chat/completions'
+LLM_MODEL = "meta/llama-3.1-8b-instruct"
+LLM_MAX_TOKENS = 1000
+TRANSCRIBE_MODEL_PATH = "models/whisper-large-v3"
+TTS_MODEL_PATH = "models/CosyVoice-300M-Instruct"
+
 llm_headers = {
     'accept': 'application/json',
     'Content-Type': 'application/json'
 }
 llm_payload = {
-    "model": "meta/llama-3.1-8b-instruct",
-    "max_tokens": 1000,
+    "model": LLM_MODEL,
+    "max_tokens": LLM_MAX_TOKENS,
     "stream": True
 }
 
@@ -44,7 +49,7 @@ vad_model = load_silero_vad()
 
 transcribe_pipe = pipeline(
     "automatic-speech-recognition",
-    model="/home/jake/models/whisper-large-v3",
+    model=TRANSCRIBE_MODEL_PATH,
     torch_dtype=torch.float16,
     device="cuda:0",
     model_kwargs={"attn_implementation": "sdpa"},
@@ -53,7 +58,7 @@ transcribe_pipe = pipeline(
 tts_queue = queue.Queue()
 chunk_intervals = [5, 25, 125, 625]
 
-cosyvoice = CosyVoice('/home/jake/models/CosyVoice-300M-Instruct', load_jit=False, load_onnx=False, fp16=True)
+cosyvoice = CosyVoice(TTS_MODEL_PATH, load_jit=False, load_onnx=False, fp16=True)
 
 rounds = 0
 first_audio = True
@@ -257,7 +262,7 @@ while True:
     messages.append({"role": "user", "content": query})
 
     llm_payload["messages"] = messages
-    llm_response = requests.post(llm_url, headers=llm_headers, json=llm_payload, stream=True)
+    llm_response = requests.post(LLM_ENDPOINT, headers=llm_headers, json=llm_payload, stream=True)
 
     full_reply = ""
     chunks_collected = []
